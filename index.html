@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>차차차짭 - 코어 프로토타입</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0f;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Noto Sans KR', sans-serif;
+    touch-action: none;
+  }
+  canvas { display: block; }
+</style>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;700;900&display=swap" rel="stylesheet">
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ====== AUDIO ======
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function playScreech(intensity = 1) {
+  const dur = 0.12 + intensity * 0.1;
+  const sz = audioCtx.sampleRate * dur;
+  const buf = audioCtx.createBuffer(1, sz, audioCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < sz; i++) d[i] = (Math.random()*2-1) * Math.exp(-i/(sz*0.3));
+  const src = audioCtx.createBufferSource(); src.buffer = buf;
+  const f = audioCtx.createBiquadFilter(); f.type='bandpass'; f.frequency.value=1800+intensity*2500; f.Q.value=6;
+  const g = audioCtx.createGain(); g.gain.value = 0.15*intensity;
+  src.connect(f).connect(g).connect(audioCtx.destination); src.start();
+}
+
+function playCrash() {
+  const sz = audioCtx.sampleRate * 0.4;
+  const buf = audioCtx.createBuffer(1, sz, audioCtx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < sz; i++) d[i] = (Math.random()*2-1)*Math.exp(-i/(sz*0.15));
+  const src = audioCtx.createBufferSource(); src.buffer = buf;
+  const f = audioCtx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=800;
+  const g = audioCtx.createGain(); g.gain.value=0.3;
+  src.connect(f).connect(g).connect(audioCtx.destination); src.start();
+}
+
+function playJump() {
+  const o = audioCtx.createOscillator(); o.type='sine';
+  o.frequency.setValueAtTime(300, audioCtx.currentTime);
+  o.frequency.exponentialRampToValueAtTime(900, audioCtx.currentTime+0.15);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.12, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime+0.2);
+  o.connect(g).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+0.2);
+}
+
+function playCombo(level) {
+  const o = audioCtx.createOscillator(); o.type='triangle';
+  const fr = 500+Math.min(level,10)*80;
+  o.frequency.setValueAtTime(fr, audioCtx.currentTime);
+  o.frequency.exponentialRampToValueAtTime(fr*1.5, audioCtx.currentTime+0.08);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.08, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime+0.12);
+  o.connect(g).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+0.12);
+}
+
+// ====== RESPONSIVE ======
+const ASPECT = 9/16;
+function resize() {
+  const h = window.innerHeight;
+  canvas.width = Math.min(window.innerWidth, h*ASPECT);
+  canvas.height = h;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ====== CONSTANTS ======
+const LANES = 5;
+const getLaneWidth = () => canvas.width / (LANES + 1.5);
+const getLaneX = (lane) => getLaneWidth()*0.75 + lane*getLaneWidth() + getLaneWidth()/2;
+const CAR_W = () => getLaneWidth() * 0.6;
+const CAR_H = () => CAR_W() * 1.6;
+const BASE_SPEED = 3;
+const getSpeed = () => BASE_SPEED * (canvas.height / 360);
+
+// Near-miss vertical zone
+const NEAR_MISS_ZONE = () => CAR_H() * 1.2;
+// How many frames after lane change counts as "active dodge"
+const DODGE_WINDOW = 25;
+
+// ====== COLORS ======
+const OBS_COLORS = [
+  { body:'#e84363', accent:'#c4324f', wind:'#ff8fa5' },
+  { body:'#4488ff', accent:'#2266dd', wind:'#88bbff' },
+  { body:'#ffaa22', accent:'#dd8800', wind:'#ffcc77' },
+  { body:'#aa44ee', accent:'#8822cc', wind:'#cc88ff' },
+  { body:'#44dd88', accent:'#22bb66', wind:'#88ffbb' },
+];
+
+// ====== STATE ======
+let state = 'title';
+let player = {
+  lane: 2, prevLane: 2, visualX: 0, y: 0,
+  dodgeTimer: 0,       // frames since last lane change
+  dodgeFromLane: -1,   // which lane player dodged FROM
+  drifting: false, driftDir: 0, driftT: 0,
+  jumping: false, jumpT: 0, squash: 1,
+};
+let obstacles = [];
+let roadMarkOffset = 0;
+let score = 0, displayScore = 0, distance = 0;
+let combo = 0, maxCombo = 0, comboTimer = 0;
+let jumpCount = 0, difficultyLevel = 0, spawnTimer = 0;
+let particles = [], tireMarks = [], scorePopups = [];
+let screenShake = 0, nearMissFlash = 0, highScore = 0;
+
+// ====== OBSTACLE TYPES ======
+const OBS_TYPES = {
+  sedan:  { w:0.55, h:1.4, minDiff:0,  speed:1.0 },
+  truck:  { w:0.65, h:2.0, minDiff:2,  speed:0.8 },
+  sports: { w:0.5,  h:1.3, minDiff:4,  speed:1.3 },
+  bus:    { w:0.7,  h:2.5, minDiff:6,  speed:0.7 },
+  moto:   { w:0.35, h:0.9, minDiff:8,  speed:1.5 },
+};
+
+// ====== SPAWNING ======
+function getAvailableTypes() {
+  return Object.entries(OBS_TYPES).filter(([_,t])=>t.minDiff<=difficultyLevel).map(([n,t])=>({name:n,...t}));
+}
+function getSpawnCount() {
+  if (difficultyLevel<2) return 1;
+  if (difficultyLevel<5) return Math.random()<0.5?2:1;
+  if (difficultyLevel<8) return Math.random()<0.3?3:2;
+  return Math.random()<0.2?4:Math.random()<0.5?3:2;
+}
+function getSpawnInterval() { return Math.max(35, 90-difficultyLevel*5); }
+
+function spawnConvoy() {
+  obstacles.push({
+    lane:Math.floor(Math.random()*LANES), y:-CAR_H()*2.5,
+    type:'convoy', w:0.7, h:2.2, speed:0.85,
+    jumped:false, colorIdx:0, nearMissTriggered:false,
+  });
+}
+
+function spawnObstacles() {
+  if (Math.random()<0.12) { spawnConvoy(); return; }
+  const types=getAvailableTypes(), count=getSpawnCount();
+  const used=new Set();
+  for (let i=0;i<count;i++) {
+    let lane,att=0;
+    do { lane=Math.floor(Math.random()*LANES); att++; } while(used.has(lane)&&att<10);
+    if (used.has(lane)||used.size>=LANES-1) continue;
+    used.add(lane);
+    const t=types[Math.floor(Math.random()*types.length)];
+    obstacles.push({
+      lane, y:-CAR_H()*2, type:t.name,
+      w:t.w, h:t.h, speed:t.speed,
+      colorIdx:Math.floor(Math.random()*OBS_COLORS.length),
+      nearMissTriggered:false,
+    });
+  }
+}
+
+// ====== EFFECTS ======
+function emitSparks(x, y, dir, count=6) {
+  for (let i=0;i<count;i++) {
+    particles.push({
+      x, y:y+Math.random()*10,
+      vx:dir*(Math.random()*4+2)+(Math.random()-0.5)*2,
+      vy:(Math.random()-0.5)*4,
+      life:1, color:'#ffdd44', size:Math.random()*3+1, type:'spark',
+    });
+  }
+}
+
+function emitDriftSmoke(x, y, count=4) {
+  for (let i=0;i<count;i++) {
+    particles.push({
+      x:x+(Math.random()-0.5)*12, y:y+Math.random()*5,
+      vx:(Math.random()-0.5)*1.5, vy:Math.random()+0.5,
+      life:1, color:'#fff', size:Math.random()*8+4, type:'smoke',
+    });
+  }
+}
+
+function emitCrashParticles(x, y) {
+  for (let i=0;i<25;i++) {
+    const a=Math.random()*Math.PI*2, s=Math.random()*6+2;
+    particles.push({
+      x,y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:1,
+      color:['#ff4466','#ff8844','#ffcc33','#fff'][Math.floor(Math.random()*4)],
+      size:Math.random()*5+2, type:'spark',
+    });
+  }
+}
+
+function addTireMark(x, y, angle) {
+  tireMarks.push({ x, y, angle, alpha:0.5, w:CAR_W()*0.12 });
+}
+
+function addScorePopup(x, y, text, color='#ffdd00') {
+  scorePopups.push({ x, y, text, color, life:1, vy:-2.5 });
+}
+
+// ====== ★ NEAR-MISS: ACTIVE DODGE ONLY ★ ======
+function checkNearMiss() {
+  if (player.jumping) return;
+  // Only check if player recently changed lanes
+  if (player.dodgeTimer <= 0 || player.dodgeTimer > DODGE_WINDOW) return;
+
+  const py = player.y;
+  const zone = NEAR_MISS_ZONE();
+  const fromLane = player.dodgeFromLane; // the lane player WAS in
+
+  for (const obs of obstacles) {
+    if (obs.nearMissTriggered) continue;
+
+    // Obstacle must be in the lane the player DODGED FROM
+    if (obs.lane !== fromLane) continue;
+
+    // Obstacle must be vertically near player
+    const vertDist = Math.abs(obs.y - py);
+    if (vertDist < zone) {
+      // ★ ACTIVE DODGE CONFIRMED ★
+      obs.nearMissTriggered = true;
+      triggerNearMiss(obs);
+    }
+  }
+}
+
+function triggerNearMiss(obs) {
+  const intensity = Math.min(combo+1, 8) / 8;
+
+  // Sound
+  playScreech(0.5 + intensity*0.5);
+  playCombo(combo);
+
+  // Combo
+  combo++;
+  comboTimer = 150;
+  maxCombo = Math.max(maxCombo, combo);
+
+  // Score
+  const bonus = 100 * combo;
+  score += bonus;
+
+  // Drift direction: away from the obstacle we just dodged
+  const dir = obs.lane > player.lane ? -1 : 1;
+  player.drifting = true;
+  player.driftDir = dir;
+  player.driftT = 0;
+
+  const px = player.visualX;
+  const py = player.y;
+
+  // Sparks from the close side (between player and obstacle)
+  const sparkSide = obs.lane > player.lane ? CAR_W()*0.35 : -CAR_W()*0.35;
+  emitSparks(px + sparkSide, py, dir, 6 + combo*3);
+
+  // Smoke from rear tires
+  emitDriftSmoke(px - dir*CAR_W()*0.2, py + CAR_H()*0.4, 3+combo);
+
+  // Tire marks
+  for (let i=0;i<3;i++) {
+    addTireMark(px + dir*CAR_W()*0.15, py+CAR_H()*(0.2+i*0.15), dir*(0.2+i*0.05));
+  }
+
+  // Popup text
+  const texts = ['끼익!','끼이익!','끼이이익!!','미쳤다!!!'];
+  const ti = Math.min(combo-1, texts.length-1);
+  const comboText = combo > 1 ? `${texts[ti]} x${combo}` : texts[0];
+  const popColor = combo>=5?'#ff3333':combo>=3?'#ff8800':'#ffdd00';
+  addScorePopup(px, py-CAR_H()*0.6, comboText, popColor);
+  addScorePopup(px+(Math.random()-0.5)*20, py-CAR_H()*0.25, `+${bonus}`, '#ffffff');
+
+  // Screen effects
+  nearMissFlash = Math.min(0.35, 0.1+combo*0.04);
+  screenShake = Math.min(combo*2, 10);
+}
+
+// ====== COLLISION ======
+function checkCollision() {
+  if (player.jumping) return false;
+  const px = player.visualX, py = player.y;
+  const pw = CAR_W()*0.35, ph = CAR_H()*0.35;
+  const lw = getLaneWidth();
+
+  for (const obs of obstacles) {
+    const ox = getLaneX(obs.lane);
+    const ow = lw*obs.w*0.35, oh = lw*obs.h*0.35;
+    if (Math.abs(px-ox)<pw+ow && Math.abs(py-obs.y)<ph+oh) {
+      if (obs.type==='convoy' && !obs.jumped) {
+        obs.jumped=true; player.jumping=true; player.jumpT=0;
+        jumpCount++; score+=200;
+        playJump();
+        addScorePopup(px, py-CAR_H(), '점프! +200', '#00ffaa');
+        emitSparks(px, py, 0, 12);
+        return false;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+// ====== DRAWING ======
+function drawRR(x,y,w,h,r) { ctx.beginPath(); ctx.roundRect(x,y,w,h,r); ctx.fill(); }
+
+function drawRoad() {
+  const lw=getLaneWidth();
+  const rL=lw*0.25, rR=canvas.width-lw*0.25;
+  ctx.fillStyle='#141e14'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle='#1e1e2a'; ctx.fillRect(rL,0,rR-rL,canvas.height);
+  ctx.fillStyle='#2a2a38'; ctx.fillRect(rL,0,4,canvas.height); ctx.fillRect(rR-4,0,4,canvas.height);
+
+  // Tire marks
+  for (const tm of tireMarks) {
+    ctx.save(); ctx.translate(tm.x,tm.y); ctx.rotate(tm.angle);
+    ctx.fillStyle=`rgba(50,50,50,${tm.alpha})`;
+    ctx.fillRect(-tm.w/2,-18,tm.w,36);
+    ctx.restore();
+  }
+
+  // Lane dashes
+  ctx.strokeStyle='#33334a'; ctx.lineWidth=2;
+  ctx.setLineDash([18,22]); ctx.lineDashOffset=-roadMarkOffset;
+  for (let i=1;i<LANES;i++) {
+    const x=getLaneX(i)-lw/2;
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+}
+
+function drawCarBody(x,y,w,h,colors,tilt=0) {
+  const r=w*0.2;
+  ctx.save(); ctx.translate(x,y); ctx.rotate(tilt);
+  ctx.fillStyle='rgba(0,0,0,0.35)'; drawRR(-w/2+4,-h/2+4,w,h,r);
+  ctx.fillStyle=colors.body; drawRR(-w/2,-h/2,w,h,r);
+  ctx.fillStyle=colors.accent; drawRR(-w/2+w*0.12,-h/2+h*0.18,w*0.76,h*0.13,r*0.5);
+  ctx.fillStyle=colors.wind; drawRR(-w/2+w*0.15,-h/2+h*0.34,w*0.7,h*0.15,r*0.4);
+  ctx.restore();
+}
+
+function drawConvoy(x,y,w,h) {
+  const r=w*0.15;
+  ctx.save(); ctx.translate(x,y);
+  ctx.fillStyle='rgba(0,0,0,0.35)'; drawRR(-w/2+4,-h/2+4,w,h,r);
+  ctx.fillStyle='#886633'; drawRR(-w/2,-h/2,w,h*0.6,r);
+  ctx.fillStyle='#775522';
+  for (let i=0;i<3;i++) ctx.fillRect(-w/2+w*0.1,-h/2+h*0.08+i*h*0.16,w*0.8,3);
+  ctx.fillStyle='#ff9900'; drawRR(-w/2,-h/2+h*0.55,w,h*0.45,r);
+  ctx.fillStyle='#ffcc66'; drawRR(-w/2+w*0.15,-h/2+h*0.62,w*0.7,h*0.14,r*0.5);
+  const pulse=Math.sin(Date.now()/150)*0.4+0.6;
+  ctx.fillStyle=`rgba(255,221,0,${pulse})`;
+  ctx.font=`bold ${w*0.45}px sans-serif`;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('▲',0,-h/2-w*0.3);
+  ctx.restore();
+}
+
+function drawPlayer() {
+  const w=CAR_W(), h=CAR_H();
+  const baseY=canvas.height*0.78;
+  player.y=baseY;
+
+  const targetX=getLaneX(player.lane);
+  player.visualX+=(targetX-player.visualX)*0.22;
+
+  let dx=player.visualX, dy=baseY, tilt=0, scale=1;
+
+  // Drift animation
+  if (player.drifting) {
+    player.driftT+=0.065;
+    if (player.driftT>=1) { player.drifting=false; player.driftT=0; }
+    else {
+      const t=player.driftT;
+      const curve=Math.sin(t*Math.PI)*Math.pow(1-t,0.5);
+      tilt=player.driftDir*curve*0.3;
+      dx+=player.driftDir*Math.sin(t*Math.PI)*getLaneWidth()*0.1;
+      if (Math.random()<0.6) emitDriftSmoke(dx-player.driftDir*w*0.2, dy+h*0.45, 1);
+    }
+  }
+
+  // Jump
+  if (player.jumping) {
+    const t=player.jumpT;
+    dy=baseY-Math.sin(t*Math.PI)*canvas.height*0.3;
+    scale=1+Math.sin(t*Math.PI)*0.25;
+    ctx.fillStyle=`rgba(0,0,0,${0.2*(1-Math.sin(t*Math.PI)*0.7)})`;
+    ctx.beginPath(); ctx.ellipse(dx,baseY+h*0.3,w*0.5*scale,6,0,0,Math.PI*2); ctx.fill();
+  }
+
+  const sq=player.squash;
+  ctx.save();
+  ctx.translate(dx,dy); ctx.scale(scale/sq,scale*sq); ctx.translate(-dx,-dy);
+  drawCarBody(dx,dy,w,h,{body:'#00d4ff',accent:'#0099cc',wind:'#88eeff'},tilt);
+  ctx.fillStyle='#ff3344'; ctx.beginPath();
+  ctx.arc(dx-w*0.28,dy+h*0.43,w*0.07,0,Math.PI*2);
+  ctx.arc(dx+w*0.28,dy+h*0.43,w*0.07,0,Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawObstacles() {
+  const lw=getLaneWidth();
+  for (const obs of obstacles) {
+    const x=getLaneX(obs.lane), w=lw*obs.w, h=lw*obs.h;
+    if (obs.type==='convoy') { drawConvoy(x,obs.y,w,h); }
+    else {
+      drawCarBody(x,obs.y,w,h,OBS_COLORS[obs.colorIdx%OBS_COLORS.length]);
+      ctx.fillStyle='#ffffaa'; ctx.beginPath();
+      ctx.arc(x-w*0.25,obs.y+h*0.45,w*0.08,0,Math.PI*2);
+      ctx.arc(x+w*0.25,obs.y+h*0.45,w*0.08,0,Math.PI*2);
+      ctx.fill();
+    }
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha=p.life;
+    if (p.type==='smoke') {
+      ctx.fillStyle=`rgba(200,200,200,${p.life*0.4})`;
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.size*(2-p.life),0,Math.PI*2); ctx.fill();
+    } else {
+      ctx.fillStyle=p.color;
+      ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size);
+    }
+  }
+  ctx.globalAlpha=1;
+}
+
+function drawPopups() {
+  for (const sp of scorePopups) {
+    const s=sp.life>0.85?(1-sp.life)/0.15*0.4+1:1;
+    ctx.globalAlpha=Math.min(1,sp.life*2.5);
+    ctx.fillStyle=sp.color;
+    const fs=Math.max(14,canvas.width*0.05)*s;
+    ctx.font=`900 ${fs}px Noto Sans KR`;
+    ctx.textAlign='center';
+    ctx.fillText(sp.text,sp.x,sp.y);
+  }
+  ctx.globalAlpha=1;
+}
+
+function drawFlash() {
+  if (nearMissFlash>0.01) {
+    const g=ctx.createRadialGradient(canvas.width/2,canvas.height/2,canvas.height*0.25,canvas.width/2,canvas.height/2,canvas.height*0.7);
+    g.addColorStop(0,'transparent');
+    g.addColorStop(1,`rgba(255,220,0,${nearMissFlash})`);
+    ctx.fillStyle=g; ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+}
+
+function drawHUD() {
+  const fs=Math.max(16,canvas.width*0.055);
+  displayScore+=(score-displayScore)*0.15;
+  ctx.fillStyle='#fff'; ctx.font=`900 ${fs}px Noto Sans KR`; ctx.textAlign='left';
+  ctx.fillText(`${Math.round(displayScore)}`,15,fs+10);
+  ctx.font=`400 ${fs*0.4}px Noto Sans KR`; ctx.fillStyle='#666';
+  ctx.fillText(`Lv.${difficultyLevel+1}`,15,fs*1.6+10);
+
+  if (combo>0) {
+    const bw=canvas.width*0.5, bh=5, bx=canvas.width/2-bw/2, by=12;
+    ctx.fillStyle='rgba(255,255,255,0.08)'; drawRR(bx,by,bw,bh,3);
+    const gr=ctx.createLinearGradient(bx,0,bx+bw,0);
+    gr.addColorStop(0,'#ffdd00'); gr.addColorStop(1,combo>5?'#ff3333':'#ff8800');
+    ctx.fillStyle=gr; drawRR(bx,by,bw*(comboTimer/150),bh,3);
+
+    const cfs=fs*(0.45+Math.min(combo,10)*0.03);
+    const p=1+Math.sin(Date.now()/80)*0.04*Math.min(combo,10);
+    ctx.save(); ctx.translate(canvas.width/2,by+bh+cfs*0.9); ctx.scale(p,p);
+    ctx.fillStyle=combo>5?'#ff3333':'#ffdd00';
+    ctx.font=`900 ${cfs}px Noto Sans KR`; ctx.textAlign='center';
+    ctx.fillText(`COMBO x${combo}`,0,0);
+    ctx.restore();
+  }
+
+  if (jumpCount>0) {
+    ctx.fillStyle='#00ffaa'; ctx.font=`700 ${fs*0.4}px Noto Sans KR`;
+    ctx.textAlign='right'; ctx.fillText(`점프 ${jumpCount}`,canvas.width-15,fs+10);
+  }
+}
+
+function drawTitle() {
+  drawRoad();
+  ctx.fillStyle='rgba(10,10,15,0.82)'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  const cx=canvas.width/2, cy=canvas.height/2, fs=Math.max(26,canvas.width*0.12);
+
+  ctx.shadowColor='#00d4ff'; ctx.shadowBlur=25;
+  ctx.fillStyle='#00d4ff'; ctx.font=`900 ${fs}px Noto Sans KR`; ctx.textAlign='center';
+  ctx.fillText('차차차짭',cx,cy-fs*0.7);
+  ctx.shadowBlur=0;
+
+  ctx.fillStyle='#778'; ctx.font=`400 ${fs*0.22}px Noto Sans KR`;
+  ctx.fillText('끼익! 아슬아슬 드리프트 레이싱',cx,cy-fs*0.1);
+
+  if (highScore>0) {
+    ctx.fillStyle='#ffdd00'; ctx.font=`700 ${fs*0.22}px Noto Sans KR`;
+    ctx.fillText(`최고 기록: ${highScore}`,cx,cy+fs*0.3);
+  }
+
+  ctx.fillStyle='#556'; ctx.font=`400 ${fs*0.17}px Noto Sans KR`;
+  ctx.fillText('다가오는 차를 옆으로 피하면 → 끼익! 드리프트!',cx,cy+fs*0.75);
+  ctx.fillText('아슬아슬하게 연속으로 피하면 → 콤보 보너스!',cx,cy+fs*1.0);
+  ctx.fillText('호송차 ▲ 에 올라타면 → 점프!',cx,cy+fs*1.25);
+
+  if (Math.sin(Date.now()/400)>0) {
+    ctx.fillStyle='#fff'; ctx.font=`700 ${fs*0.28}px Noto Sans KR`;
+    ctx.fillText('탭하여 시작',cx,cy+fs*1.8);
+  }
+  ctx.fillStyle='#444'; ctx.font=`400 ${fs*0.15}px Noto Sans KR`;
+  ctx.fillText('← → / 좌우탭 / 스와이프',cx,cy+fs*2.15);
+}
+
+function drawGameOver() {
+  ctx.fillStyle='rgba(10,10,15,0.88)'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  const cx=canvas.width/2, cy=canvas.height/2, fs=Math.max(20,canvas.width*0.08);
+
+  ctx.shadowColor='#ff4466'; ctx.shadowBlur=15;
+  ctx.fillStyle='#ff4466'; ctx.font=`900 ${fs}px Noto Sans KR`; ctx.textAlign='center';
+  ctx.fillText('CRASH!',cx,cy-fs*1.2);
+  ctx.shadowBlur=0;
+
+  ctx.fillStyle='#fff'; ctx.font=`700 ${fs*0.65}px Noto Sans KR`;
+  ctx.fillText(`${score}점`,cx,cy-fs*0.2);
+  ctx.fillStyle='#aaa'; ctx.font=`400 ${fs*0.38}px Noto Sans KR`;
+  ctx.fillText(`최대 콤보 x${maxCombo}  ·  점프 ${jumpCount}`,cx,cy+fs*0.4);
+
+  if (score>=highScore&&score>0) {
+    ctx.fillStyle='#ffdd00'; ctx.font=`700 ${fs*0.4}px Noto Sans KR`;
+    ctx.fillText('★ 최고 기록! ★',cx,cy+fs*1.0);
+  }
+  if (Math.sin(Date.now()/400)>0) {
+    ctx.fillStyle='#fff'; ctx.font=`700 ${fs*0.32}px Noto Sans KR`;
+    ctx.fillText('탭하여 재시작',cx,cy+fs*1.8);
+  }
+}
+
+// ====== INPUT ======
+let touchStartX=0;
+
+function movePlayer(dir) {
+  if (state!=='playing'||player.jumping) return;
+  const nl=player.lane+dir;
+  if (nl<0||nl>=LANES) return;
+
+  // ★ Record dodge: player is leaving current lane
+  player.dodgeFromLane = player.lane;
+  player.dodgeTimer = DODGE_WINDOW;
+
+  player.lane = nl;
+}
+
+document.addEventListener('keydown',(e)=>{
+  if (e.key==='ArrowLeft'||e.key==='a') movePlayer(-1);
+  if (e.key==='ArrowRight'||e.key==='d') movePlayer(1);
+  if ((e.key===' '||e.key==='Enter')&&(state==='title'||state==='gameover')) startGame();
+});
+canvas.addEventListener('touchstart',(e)=>{
+  e.preventDefault();
+  if (audioCtx.state==='suspended') audioCtx.resume();
+  touchStartX=e.touches[0].clientX;
+  if (state==='title'||state==='gameover') startGame();
+});
+canvas.addEventListener('touchend',(e)=>{
+  e.preventDefault();
+  const dx=e.changedTouches[0].clientX-touchStartX;
+  if (Math.abs(dx)>25) movePlayer(dx>0?1:-1);
+  else {
+    const rect=canvas.getBoundingClientRect();
+    movePlayer((e.changedTouches[0].clientX-rect.left)<canvas.width/2?-1:1);
+  }
+});
+canvas.addEventListener('click',(e)=>{
+  if (audioCtx.state==='suspended') audioCtx.resume();
+  if (state==='title'||state==='gameover'){startGame();return;}
+  const rect=canvas.getBoundingClientRect();
+  movePlayer((e.clientX-rect.left)<canvas.width/2?-1:1);
+});
+
+// ====== LIFECYCLE ======
+function startGame() {
+  state='playing';
+  player={
+    lane:2, prevLane:2, visualX:getLaneX(2), y:canvas.height*0.78,
+    dodgeTimer:0, dodgeFromLane:-1,
+    drifting:false, driftDir:0, driftT:0,
+    jumping:false, jumpT:0, squash:1,
+  };
+  obstacles=[]; score=0; displayScore=0; distance=0;
+  combo=0; maxCombo=0; comboTimer=0;
+  jumpCount=0; difficultyLevel=0; spawnTimer=0;
+  particles=[]; tireMarks=[]; scorePopups=[];
+  screenShake=0; nearMissFlash=0;
+}
+
+function gameOver() {
+  state='gameover';
+  highScore=Math.max(highScore,score);
+  screenShake=12;
+  playCrash();
+  emitCrashParticles(player.visualX,player.y);
+}
+
+// ====== UPDATE ======
+function update() {
+  if (state==='title'){roadMarkOffset+=getSpeed()*0.5;return;}
+  if (state==='gameover'){
+    screenShake*=0.92; nearMissFlash*=0.9;
+    updateParts(); updatePops(); return;
+  }
+
+  const spd=getSpeed();
+  roadMarkOffset+=spd;
+  distance+=spd;
+  difficultyLevel=Math.floor(distance/(canvas.height*2));
+  score+=1;
+
+  // Dodge window countdown
+  if (player.dodgeTimer>0) player.dodgeTimer--;
+
+  // Combo timer
+  if (combo>0){comboTimer--;if(comboTimer<=0)combo=0;}
+
+  // Spawn
+  spawnTimer--;
+  if (spawnTimer<=0){spawnObstacles();spawnTimer=getSpawnInterval();}
+
+  // Move obstacles
+  for (let i=obstacles.length-1;i>=0;i--) {
+    obstacles[i].y+=spd*obstacles[i].speed;
+    if (obstacles[i].y>canvas.height+getLaneWidth()*3) obstacles.splice(i,1);
+  }
+
+  // Jump
+  if (player.jumping) {
+    player.jumpT+=0.025;
+    if (player.jumpT>=1){player.jumping=false;player.jumpT=0;player.squash=0.7;}
+  }
+  if (player.squash<1){player.squash+=(1-player.squash)*0.15;if(player.squash>0.99)player.squash=1;}
+
+  // ★ Active dodge near-miss check
+  checkNearMiss();
+
+  // Collision
+  if (checkCollision()) gameOver();
+
+  // Tire marks fade & scroll
+  for (let i=tireMarks.length-1;i>=0;i--) {
+    tireMarks[i].alpha-=0.002;
+    tireMarks[i].y+=spd*0.5;
+    if (tireMarks[i].alpha<=0) tireMarks.splice(i,1);
+  }
+
+  updateParts(); updatePops();
+  nearMissFlash*=0.92;
+  screenShake*=0.9;
+  if (screenShake<0.3)screenShake=0;
+}
+
+function updateParts() {
+  for (let i=particles.length-1;i>=0;i--) {
+    const p=particles[i];
+    p.x+=p.vx; p.y+=p.vy;
+    if (p.type==='smoke'){p.vx*=0.95;p.vy*=0.95;p.life-=0.02;}
+    else{p.vy+=0.18;p.life-=0.03;}
+    if (p.life<=0)particles.splice(i,1);
+  }
+}
+
+function updatePops() {
+  for (let i=scorePopups.length-1;i>=0;i--) {
+    const sp=scorePopups[i];
+    sp.y+=sp.vy; sp.vy*=0.96; sp.life-=0.018;
+    if (sp.life<=0)scorePopups.splice(i,1);
+  }
+}
+
+// ====== DRAW + LOOP ======
+function draw() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if (state==='title'){drawTitle();return;}
+  ctx.save();
+  if (screenShake>0.3) ctx.translate((Math.random()-0.5)*screenShake,(Math.random()-0.5)*screenShake);
+  drawRoad(); drawObstacles(); drawPlayer();
+  drawParticles(); drawPopups(); drawFlash(); drawHUD();
+  ctx.restore();
+  if (state==='gameover') drawGameOver();
+}
+
+(function loop(){update();draw();requestAnimationFrame(loop);})();
+</script>
+</body>
+</html>
